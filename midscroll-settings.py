@@ -74,6 +74,10 @@ BOOLS = [
      "While you drag, draw a cursor that follows your hand from the "
      "anchor point. It only draws - the real pointer stays put so the "
      "scroll can't leak into another window."),
+    ("SNAP_CURSOR_ON_RELEASE", "Snap cursor on release",
+     "When a drag-scroll ends, move the anchored cursor to where your "
+     "hand is (the ghost cursor position), like Windows autoscroll does. "
+     "Off by default."),
     ("DESKTOP_SCROLL", "Enable on desktop & panels",
      "Allow autoscroll while the desktop or a panel/taskbar is focused. "
      "Off by default so a middle-drag doesn't hijack the desktop."),
@@ -83,6 +87,7 @@ DEFAULTS = {
     "MAX_PX_PER_SEC": 30000.0, "PX_PER_NOTCH": 55.0, "MAX_DRAG_PX": 1200.0,
     "TICK_HZ": 90.0, "GHOST_SCALE": 1.0, "NATURAL": False,
     "TOGGLE_MODE": False, "DESKTOP_SCROLL": False, "GHOST_CURSOR": True,
+    "SNAP_CURSOR_ON_RELEASE": True,
     "BLACKLIST": "freecad, orcaslicer, minecraft",
     "EXTRA_DEVICES": "", "IGNORE_DEVICES": "",
     # Not settable here: only a root edit of the config turns it on.

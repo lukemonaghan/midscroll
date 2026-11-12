@@ -1,39 +1,4 @@
 #!/usr/bin/python3
-"""midscroll - Windows-style middle-button drag autoscroll for Linux.
-
-Hold the middle mouse button and drag: the page scrolls in that direction,
-and the farther you drag from the point where you pressed, the faster it
-scrolls. Release to stop. A quick middle click without dragging passes
-through as a normal middle click (paste / open link in new tab).
-
-With TOGGLE_MODE enabled the interaction is instead the Windows-Explorer /
-Firefox style: a single middle click starts autoscroll, the cursor then
-moves freely and the page scrolls by its distance from that origin, and any
-mouse click stops it. (In that mode the middle button no longer pastes.)
-
-Works on Wayland and X11 in any application, because it sits at the kernel
-input layer: it grabs the real mouse and re-emits its events through a
-per-mouse uinput mirror, injecting high-resolution wheel events while a
-middle-drag is active. Each mirror copies its source mouse's name and
-vendor/product IDs, so libinput/KDE keep applying that mouse's own
-pointer-speed and acceleration settings instead of reverting to defaults.
-
-Apps that use middle-drag themselves (CAD, slicers, games) can be
-blacklisted by window class; while one of them is focused, the middle
-button passes straight through. The focused window's class is reported by
-the session helper (midscroll-overlay) over the state socket.
-
-Which devices count as a mouse is decided automatically, and can be
-overridden per device with EXTRA_DEVICES / IGNORE_DEVICES (see
---list-devices for the identifiers, and SECURITY.md for what forcing a
-device does and does not allow).
-
-Tunables can be overridden in /etc/midscroll.conf (KEY = value lines) or
-per run on the command line: midscroll --help. The config file decides
-which devices this daemon opens, so it is only read when it is owned by
-root and not writable by anyone else.
-"""
-
 import argparse
 import asyncio
 import logging
@@ -48,7 +13,7 @@ import time
 
 from evdev import InputDevice, UInput, ecodes as e, list_devices
 
-VERSION = "1.14"
+VERSION = "1.15"
 
 log = logging.getLogger("midscroll")
 
@@ -69,6 +34,8 @@ TOGGLE_MODE = False       # True: click to start/stop instead of hold-and-drag
 DESKTOP_SCROLL = False    # True: also autoscroll over the desktop and panels
 GHOST_CURSOR = True       # True: helper draws a cursor at the dragged point
 GHOST_SCALE = 1.0         # ghost travel per unit of mouse motion
+SNAP_CURSOR_ON_RELEASE = True   # True: warp the anchored cursor to the
+                                # ghost position once the drag ends
 
 # Window-class substrings (case-insensitive) over which midscroll pauses
 # and the middle button behaves natively.
@@ -98,6 +65,7 @@ DESKTOP_SHELLS = ["plasmashell", "nemo-desktop", "xfdesktop", "waybar",
 HIRES_PER_LINE = 120      # kernel convention: 120 hi-res units per notch
 MAX_TICK_DT = 0.25        # cap the per-tick time step (see ticker())
 GHOST_HZ = 60.0           # rate of ghost-cursor updates to the helper
+RELEASE_FREEZE_SEC = 0.1  # absorb motion immediately after button release
 PHYS_MARKER = "midscroll"  # phys string on our mirrors, so we skip our own
 CONFIG_PATH = "/etc/midscroll.conf"
 SOCK_DIR = "/run/midscroll"
@@ -122,7 +90,7 @@ WRITE_DROP_BYTES = 65536   # disconnect a client this far behind
 FLOAT_KEYS = {"DEADZONE_PX", "TICK_HZ", "SPEED_MULT", "SPEED_EXP",
               "MAX_PX_PER_SEC", "PX_PER_NOTCH", "MAX_DRAG_PX", "GHOST_SCALE"}
 BOOL_KEYS = {"NATURAL", "TOGGLE_MODE", "DESKTOP_SCROLL", "GHOST_CURSOR",
-             "ALLOW_KEYBOARDS"}
+             "SNAP_CURSOR_ON_RELEASE", "ALLOW_KEYBOARDS"}
 DEVICE_KEYS = {"EXTRA_DEVICES", "IGNORE_DEVICES"}
 # Zero would divide by zero (TICK_HZ, PX_PER_NOTCH) or make the daemon
 # silently never scroll; only the dead zone may be zero.
@@ -135,7 +103,12 @@ KEYBOARD_KEYS = (e.KEY_A, e.KEY_Z, e.KEY_SPACE, e.KEY_ENTER)
 
 
 def parse_bool(text):
-    return text.strip().lower() in ("1", "true", "yes", "on")
+    value = text.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"invalid boolean {text!r}")
 
 
 def validate(key, val):
@@ -298,7 +271,11 @@ def load_config(path=CONFIG_PATH):
                 continue
             globals()[k] = val
         elif k in BOOL_KEYS:
-            globals()[k] = parse_bool(v)
+            try:
+                globals()[k] = parse_bool(v)
+            except ValueError as err:
+                log.error("config: %s = %r rejected: %s (keeping %s)",
+                          k, v, err, globals()[k])
         elif k == "BLACKLIST":
             globals()["BLACKLIST"] = parse_blacklist(v)
         elif k in DEVICE_KEYS:
@@ -318,6 +295,49 @@ def _peer_uid(sock):
         return uid
     except OSError:
         return None
+
+
+def _peer_pid(sock):
+    if sock is None:
+        return None
+    try:
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", creds)
+        return pid
+    except OSError:
+        return None
+
+
+def _peer_is_overlay(pid):
+    """Sanity check that a socket peer is the overlay helper.
+
+    The overlay is a Python script, so /proc/<pid>/cmdline reads
+    "/usr/bin/python3 /usr/bin/midscroll-overlay": through its shebang, and
+    again after it re-execs itself to set LD_PRELOAD. argv[0] is therefore
+    the interpreter, and the script name is the first non-option argument.
+    The seat check on the peer's uid is the real gate; this only keeps
+    unrelated processes of a logged-in user from being counted as helpers.
+    """
+    if pid is None:
+        return False
+    names = ("midscroll-overlay", "midscroll-overlay.py")
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [a.decode("utf-8") for a in f.read().split(b"\0") if a]
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not argv:
+        return False
+    first = os.path.basename(argv[0])
+    if first in names:
+        return True
+    if first.startswith("python"):
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                continue
+            return os.path.basename(arg) in names
+    return False
 
 
 def _uid_state(uid):
@@ -356,6 +376,11 @@ def _uid_is_active(uid):
     return _uid_state(uid) == "active"
 
 
+class FocusClient:
+    def __init__(self, uid):
+        self.uid = uid
+
+
 class FocusFilter:
     """The focused window class reported by each connected helper.
 
@@ -370,6 +395,8 @@ class FocusFilter:
         self.by_client = {}
 
     def update(self, client, wclass):
+        if not _uid_is_active(client.uid):
+            return
         # Bounded and stripped of control characters: this string comes
         # off a socket and ends up in the journal.
         clean = "".join(c for c in wclass if c.isprintable())[:MAX_FOCUS_LEN]
@@ -382,7 +409,9 @@ class FocusFilter:
     @property
     def blocked(self):
         blockers = BLACKLIST if DESKTOP_SCROLL else BLACKLIST + DESKTOP_SHELLS
-        for wclass in self.by_client.values():
+        for client, wclass in self.by_client.items():
+            if not _uid_is_active(client.uid):
+                continue
             c = wclass.lower()
             if any(b in c for b in blockers):
                 return True
@@ -415,6 +444,7 @@ class Notifier:
         self.server = None
         self.last_pos = None
         self.active_uids = frozenset()
+        self.ghost_visible = None
 
     async def start(self):
         try:
@@ -441,9 +471,12 @@ class Notifier:
         return same >= MAX_CLIENTS_PER_UID
 
     async def _client(self, reader, writer):
-        uid = _peer_uid(writer.get_extra_info("socket"))
-        if uid is None or not _uid_has_seat(uid):
-            log.debug("rejected socket from uid %s", uid)
+        peer_socket = writer.get_extra_info("socket")
+        uid = _peer_uid(peer_socket)
+        pid = _peer_pid(peer_socket)
+        if (uid is None or not _uid_has_seat(uid)
+                or not _peer_is_overlay(pid)):
+            log.debug("rejected state socket peer uid=%s pid=%s", uid, pid)
             writer.close()
             return
         if self._too_many(uid):
@@ -452,10 +485,10 @@ class Notifier:
             log.warning("too many state-socket clients; refusing uid %s", uid)
             writer.close()
             return
-        client = object()  # identity key for this connection's focus report
+        client = FocusClient(uid)
         self.writers[writer] = uid
-        if _uid_is_active(uid):
-            self.active_uids |= {uid}
+        self.active_uids = frozenset(
+            u for u in set(self.writers.values()) if _uid_is_active(u))
         try:
             writer.write(self.msg)
             while True:
@@ -510,6 +543,15 @@ class Notifier:
                 u for u in set(self.writers.values()) if _uid_is_active(u))
         self._broadcast(msg)
 
+    def heartbeat(self):
+        """Re-send "1" during a drag so the helper's watchdog stays quiet.
+
+        set() and pos() only speak on change, so a drag held still for a few
+        seconds would otherwise look like a dead daemon and be hidden.
+        """
+        if self.msg == b"1\n":
+            self._broadcast(self.msg)
+
     def pos(self, dx, dy):
         """Offset of the ghost cursor from the anchor, in screen pixels."""
         if self.msg != b"1\n":
@@ -519,6 +561,12 @@ class Notifier:
             return
         self.last_pos = p
         self._broadcast(b"pos %d %d\n" % p, active_only=True)
+
+    def ghost(self, visible):
+        if visible == self.ghost_visible:
+            return
+        self.ghost_visible = visible
+        self._broadcast(b"ghost %d\n" % int(visible), active_only=True)
 
 
 class State:
@@ -539,6 +587,8 @@ class State:
         self.toggled = False      # toggle-mode scrolling (no button held)
         self.passthrough = False  # middle held over a blacklisted app
         self.eat_release = None   # button whose release to swallow (toggle)
+        self.release_pending = False
+        self.release_frozen_until = 0.0
         self.dx = 0.0             # cursor offset from the origin
         self.dy = 0.0
         self.acc_v = 0.0          # fractional hi-res units carried over
@@ -561,10 +611,15 @@ class State:
         self.toggled = True
 
     def release(self):
-        """Return True if this was a plain click (no drag)."""
+        """Return (was_click, dx, dy).
+
+        dx/dy are the accumulated drag offset at release time, before it's
+        cleared.  A plain middle-click (no drag) returns dx=0, dy=0.
+        """
         was_click = self.pending
+        dx, dy = self.dx, self.dy
         self.reset()
-        return was_click
+        return was_click, dx, dy
 
 
 def _clamp(v):
@@ -572,6 +627,36 @@ def _clamp(v):
     # distance on its own; cap it the way Windows caps the cursor at the
     # screen edge, so slowing down never needs a huge reverse drag.
     return math.copysign(min(abs(v), MAX_DRAG_PX), v)
+
+
+def _snap_cursor(ui, dx, dy):
+    """Replay accumulated drag offset without diagonal acceleration coupling.
+
+    Pointer acceleration can treat a simultaneous X/Y report as a faster
+    diagonal vector than either axis alone. Emit the axes in separate reports
+    so the final position follows the independently tracked ghost offsets.
+    """
+    x, y = int(dx), int(dy)
+    if x:
+        ui.write(e.EV_REL, e.REL_X, x)
+        ui.syn()
+    if y:
+        ui.write(e.EV_REL, e.REL_Y, y)
+        ui.syn()
+
+
+def _finish_release(st, ui, notifier):
+    """Finish a middle release after its evdev report is complete."""
+    was_click, dx, dy = st.release()
+    if SNAP_CURSOR_ON_RELEASE:
+        sx = int(dx * GHOST_SCALE)
+        sy = int(dy * GHOST_SCALE)
+        if sx or sy:
+            log.info("snap cursor: dx=%g dy=%g", sx, sy)
+            _snap_cursor(ui, sx, sy)
+    notifier.ghost(False)
+    st.release_frozen_until = time.monotonic() + RELEASE_FREEZE_SEC
+    return was_click
 
 
 def _is_button(code):
@@ -609,6 +694,7 @@ async def ticker(states, notifier, focus):
     # would quietly make scrolling slower than configured.
     last = time.monotonic()
     last_ghost = last
+    last_beat = last
     while True:
         if not any(st.pending or st.scrolling for st in states.values()):
             # Nothing can change until a button event arrives, so park
@@ -629,14 +715,24 @@ async def ticker(states, notifier, focus):
             except Exception as err:  # one bad tick must not kill the loop
                 log.error("tick error: %r", err)
         notifier.set(any(st.scrolling for st in states.values()))
+        if now - last_beat >= 1.0:
+            last_beat = now
+            notifier.heartbeat()
         if GHOST_CURSOR and now - last_ghost >= 1.0 / GHOST_HZ:
             last_ghost = now
             # Only an anchored drag has a ghost: in toggle mode the real
             # cursor moves, so there is nothing to stand in for it.
-            dragging = next((s for s in states.values() if s.active), None)
-            if dragging is not None:
+            dragging = [s for s in states.values() if s.active]
+            # One overlay cannot faithfully represent two independent
+            # anchored pointers, so hide the ghost rather than showing the
+            # wrong device's position.
+            if len(dragging) == 1:
+                dragging = dragging[0]
+                notifier.ghost(True)
                 notifier.pos(dragging.dx * GHOST_SCALE,
                              dragging.dy * GHOST_SCALE)
+            elif len(dragging) > 1:
+                notifier.ghost(False)
 
 
 def tick(st, dt, focus):
@@ -708,6 +804,7 @@ def _resync(ui, dev, held, st):
             changed = True
         elif st.pending or st.active:
             st.release()  # drag button never went to the virtual device
+                          # (dx/dy discarded; no snap needed on unplugged)
     if changed:
         ui.syn()
 
@@ -806,7 +903,7 @@ def _toggle_key(ev, st, ui, focus):
     return False  # other buttons while idle pass straight through
 
 
-async def pump(path, dev, states, tasks, focus, our_paths):
+async def pump(path, dev, states, tasks, focus, our_paths, notifier):
     """Grab one mouse and forward its events, intercepting middle-drags."""
     # Belt to is_mouse's phys check and main's our_paths skip: never pump one
     # of our own mirrors. Guards the brief hotplug window between a mirror
@@ -860,14 +957,18 @@ async def pump(path, dev, states, tasks, focus, our_paths):
                     if st.passthrough:
                         st.passthrough = False
                         ui.write(e.EV_KEY, e.BTN_MIDDLE, 0)
-                    elif st.release():
-                        # No drag happened: replay as a normal middle click.
-                        ui.write(e.EV_KEY, e.BTN_MIDDLE, 1)
-                        ui.syn()
-                        ui.write(e.EV_KEY, e.BTN_MIDDLE, 0)
-                        ui.syn()
+                    else:
+                        st.release_pending = True
                 continue
             if ev.type == e.EV_REL and ev.code in (e.REL_X, e.REL_Y):
+                if st.release_pending:
+                    # Motion sharing the release report happened after the
+                    # button release; it must not move past the ghost.
+                    continue
+                if st.release_frozen_until:
+                    if time.monotonic() < st.release_frozen_until:
+                        continue
+                    st.release_frozen_until = 0.0
                 if st.toggled:
                     # Toggle mode: track distance from the origin but let the
                     # motion through, so the cursor follows the hand like
@@ -881,10 +982,21 @@ async def pump(path, dev, states, tasks, focus, our_paths):
                     # hitting the original window instead of whatever the
                     # cursor would have drifted over.
                     _accumulate(st, ev)
+                    if st.active:
+                        notifier.ghost(True)
+                        notifier.pos(st.dx * GHOST_SCALE,
+                                     st.dy * GHOST_SCALE)
                     continue
             if ev.type == e.EV_SYN:
                 if ev.code == e.SYN_DROPPED:
                     _resync(ui, dev, held, st)
+                elif st.release_pending:
+                    was_click = _finish_release(st, ui, notifier)
+                    if was_click:
+                        ui.write(e.EV_KEY, e.BTN_MIDDLE, 1)
+                        ui.syn()
+                        ui.write(e.EV_KEY, e.BTN_MIDDLE, 0)
+                        ui.syn()
                 else:
                     ui.syn()
             elif ev.type in (e.EV_KEY, e.EV_REL):
@@ -1108,7 +1220,7 @@ async def main():
                     dev.close()
                     continue
                 tasks[path] = asyncio.create_task(
-                    pump(path, dev, states, tasks, focus, our_paths))
+                    pump(path, dev, states, tasks, focus, our_paths, notifier))
             await asyncio.sleep(2)
     finally:
         tick_task.cancel()
@@ -1171,6 +1283,10 @@ def parse_args(argv=None):
                    default=None, dest="ghost_cursor",
                    help="tell the session helper where to draw a ghost "
                         "cursor while dragging (default: on)")
+    p.add_argument("--snap-cursor", action=argparse.BooleanOptionalAction,
+                   default=None, dest="snap_cursor",
+                   help="warp the anchored cursor to the ghost position "
+                        "once a drag-scroll ends (default: on)")
     p.add_argument("--blacklist", metavar="APPS", default=None,
                    help="comma-separated window-class substrings over which "
                         "midscroll pauses (default: "
@@ -1214,6 +1330,8 @@ def cli():
         globals()["DESKTOP_SCROLL"] = args.desktop_scroll
     if args.ghost_cursor is not None:
         globals()["GHOST_CURSOR"] = args.ghost_cursor
+    if args.snap_cursor is not None:
+        globals()["SNAP_CURSOR_ON_RELEASE"] = args.snap_cursor
     if args.blacklist is not None:
         globals()["BLACKLIST"] = parse_blacklist(args.blacklist)
         globals()["_blacklist_from_cli"] = True
@@ -1225,11 +1343,12 @@ def cli():
         report_devices()
         return
     log.debug("tunables: %s NATURAL=%s TOGGLE_MODE=%s DESKTOP_SCROLL=%s "
-              "GHOST_CURSOR=%s ALLOW_KEYBOARDS=%s BLACKLIST=%s "
+              "GHOST_CURSOR=%s SNAP_CURSOR=%s ALLOW_KEYBOARDS=%s BLACKLIST=%s "
               "EXTRA_DEVICES=%s IGNORE_DEVICES=%s",
               " ".join(f"{k}={globals()[k]:g}" for k in sorted(FLOAT_KEYS)),
               NATURAL, TOGGLE_MODE, DESKTOP_SCROLL, GHOST_CURSOR,
-              ALLOW_KEYBOARDS, BLACKLIST, EXTRA_DEVICES, IGNORE_DEVICES)
+              SNAP_CURSOR_ON_RELEASE, ALLOW_KEYBOARDS, BLACKLIST,
+              EXTRA_DEVICES, IGNORE_DEVICES)
     asyncio.run(main())
 
 

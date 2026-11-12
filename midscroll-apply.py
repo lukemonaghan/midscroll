@@ -49,7 +49,8 @@ FLOATS = {
     "TICK_HZ": True,
     "GHOST_SCALE": True,
 }
-BOOLS = ("NATURAL", "TOGGLE_MODE", "DESKTOP_SCROLL", "GHOST_CURSOR")
+BOOLS = ("NATURAL", "TOGGLE_MODE", "DESKTOP_SCROLL", "GHOST_CURSOR",
+         "SNAP_CURSOR_ON_RELEASE")
 DEVICES = ("EXTRA_DEVICES", "IGNORE_DEVICES")
 KEYS = tuple(FLOATS) + BOOLS + DEVICES + ("BLACKLIST",)
 
@@ -59,6 +60,7 @@ DEFAULTS = {
     "MAX_PX_PER_SEC": 30000.0, "PX_PER_NOTCH": 55.0, "MAX_DRAG_PX": 1200.0,
     "TICK_HZ": 90.0, "GHOST_SCALE": 1.0, "NATURAL": False,
     "TOGGLE_MODE": False, "DESKTOP_SCROLL": False, "GHOST_CURSOR": True,
+    "SNAP_CURSOR_ON_RELEASE": True,
     "BLACKLIST": "freecad, orcaslicer, minecraft",
     "EXTRA_DEVICES": "", "IGNORE_DEVICES": "",
 }
@@ -92,6 +94,8 @@ DESKTOP_SCROLL = {DESKTOP_SCROLL}
 # GHOST_SCALE is how far that drawn cursor travels per unit of mouse motion.
 GHOST_CURSOR = {GHOST_CURSOR}
 GHOST_SCALE = {GHOST_SCALE:g}
+SNAP_CURSOR_ON_RELEASE = {SNAP_CURSOR_ON_RELEASE}    # True: snap the anchored
+    # cursor to the ghost position once the drag ends
 
 # Apps that use middle-drag themselves: while one of these is the focused
 # window, midscroll pauses. Comma-separated, case-insensitive window-class
@@ -236,6 +240,7 @@ def main(argv):
         TOGGLE_MODE="true" if values["TOGGLE_MODE"] else "false",
         DESKTOP_SCROLL="true" if values["DESKTOP_SCROLL"] else "false",
         GHOST_CURSOR="true" if values["GHOST_CURSOR"] else "false",
+        SNAP_CURSOR_ON_RELEASE="true" if values["SNAP_CURSOR_ON_RELEASE"] else "false",
         BLACKLIST=values["BLACKLIST"],
         EXTRA_DEVICES=values["EXTRA_DEVICES"],
         IGNORE_DEVICES=values["IGNORE_DEVICES"],
@@ -251,6 +256,21 @@ def main(argv):
         old_text = None
 
     directory = os.path.dirname(CONFIG_PATH) or "/"
+    try:
+        directory_stat = os.stat(directory)
+    except OSError as err:
+        die(f"cannot inspect {directory}: {err}")
+    if (directory_stat.st_uid != 0
+            or directory_stat.st_mode & 0o022
+            or not os.path.isdir(directory)):
+        die(f"refusing to write through untrusted directory {directory}")
+    try:
+        with open(CONFIG_PATH, "rb") as old_file:
+            old_config = old_file.read()
+    except FileNotFoundError:
+        old_config = None
+    except OSError as err:
+        die(f"cannot read existing {CONFIG_PATH}: {err}")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".midscroll.conf.")
     try:
         with os.fdopen(fd, "w") as f:
@@ -282,6 +302,19 @@ def main(argv):
             subprocess.run(["systemctl", "restart", "midscroll.service"],
                            check=True)
         except (OSError, subprocess.CalledProcessError) as err:
+            if old_config is not None:
+                restore_fd, restore_tmp = tempfile.mkstemp(
+                    dir=directory, prefix=".midscroll.conf.restore.")
+                try:
+                    with os.fdopen(restore_fd, "wb") as restore_file:
+                        restore_file.write(old_config)
+                    os.chmod(restore_tmp, 0o644)
+                    os.replace(restore_tmp, CONFIG_PATH)
+                except OSError:
+                    try:
+                        os.unlink(restore_tmp)
+                    except OSError:
+                        pass
             die(f"restart failed: {err}")
         print("restarted midscroll.service")
 

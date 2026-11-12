@@ -410,16 +410,10 @@ if WAYLAND:
             self.badge.add_css_class("badge")
             self.badge.set_size_request(BADGE_PX, BADGE_PX)
             self.badge.append(icon)
-            cursor = load_theme_cursor()
             self.ghost = Gtk.DrawingArea()
-            if cursor is None:
-                self.hotspot = (1, 1)  # the fallback arrow's tip
-                self.ghost.set_size_request(GHOST_W, GHOST_H)
-            else:
-                self.hotspot = (cursor[1], cursor[2])
-                self.ghost.set_size_request(cursor[0].get_width(),
-                                            cursor[0].get_height())
-            self.ghost.set_draw_func(make_ghost_drawer(cursor))
+            self.cursor = None
+            self.cursor_signature = None
+            self.ghost_visible = True
             self.fixed = Gtk.Fixed()
             self.fixed.put(self.badge, 0, 0)
             self.fixed.put(self.ghost, 0, 0)
@@ -439,11 +433,40 @@ if WAYLAND:
             self.win.connect("map", self._make_click_through)
             self.active = False
             self.seq = 0        # discards stale position queries
-            self.anchor = None  # where the pointer is pinned, monitor-local
+            self.anchor = None  # global anchor position
             self.offset = (0, 0)
             self.geo = None     # geometry of the monitor we are drawn on
             self.last_line = time.monotonic()
             GLib.timeout_add_seconds(1, self._check_stale)
+            self._refresh_cursor()
+
+        def _cursor_signature(self):
+            theme = cursor_theme_name()
+            path = find_cursor_file(theme)
+            try:
+                stat_result = os.stat(path) if path else None
+            except OSError:
+                stat_result = None
+            return (theme, cursor_size(), path,
+                    stat_result.st_mtime_ns if stat_result else None,
+                    stat_result.st_size if stat_result else None)
+
+        def _refresh_cursor(self):
+            """Reload the ghost when the compositor's cursor settings change."""
+            signature = self._cursor_signature()
+            if signature == self.cursor_signature:
+                return
+            cursor = load_theme_cursor()
+            self.cursor_signature = signature
+            self.cursor = cursor
+            if cursor is None:
+                self.hotspot = (1, 1)
+                self.ghost.set_size_request(GHOST_W, GHOST_H)
+            else:
+                self.hotspot = (cursor[1], cursor[2])
+                self.ghost.set_size_request(cursor[0].get_width(),
+                                            cursor[0].get_height())
+            self.ghost.set_draw_func(make_ghost_drawer(cursor))
 
         def _make_click_through(self, *_):
             surface = self.win.get_surface()
@@ -460,6 +483,7 @@ if WAYLAND:
             """
             if self.active:
                 self._make_click_through()
+                self._refresh_cursor()
                 if time.monotonic() - self.last_line > STALE_SEC:
                     log.warning("no state from midscroll for %.0fs; hiding",
                                 STALE_SEC)
@@ -480,6 +504,7 @@ if WAYLAND:
                 self.anchor = None
                 self.offset = (0, 0)
                 return
+            self._refresh_cursor()
             # The pointer is pinned for the whole drag, so one query does.
             try:
                 proc = Gio.Subprocess.new(
@@ -497,6 +522,10 @@ if WAYLAND:
             self.offset = (dx, dy)
             if self.active and self.anchor is not None:
                 self._layout()
+
+        def set_ghost_visible(self, visible):
+            self.ghost_visible = visible
+            self.ghost.set_visible(visible)
 
         def _got_pos(self, proc, res, seq):
             try:
@@ -516,8 +545,11 @@ if WAYLAND:
             self._make_click_through()
 
         def _anchor_at(self, x, y):
-            # Layer-shell surfaces belong to one output; find the monitor
-            # holding the (global) anchor and work in its coordinates.
+            self.anchor = (x, y)
+            self._select_monitor(x, y)
+
+        def _select_monitor(self, x, y):
+            """Select the output containing a global pointer coordinate."""
             monitors = Gdk.Display.get_default().get_monitors()
             self.geo = None
             for i in range(monitors.get_n_items()):
@@ -528,24 +560,29 @@ if WAYLAND:
                     LayerShell.set_monitor(self.win, mon)
                     self.geo = geo
                     break
-            if self.geo is None:
-                self.anchor = (x, y)
-            else:
-                self.anchor = (x - self.geo.x, y - self.geo.y)
 
         def _layout(self):
             if self.anchor is None:
                 return
             ax, ay = self.anchor
-            self.fixed.move(self.badge, ax - BADGE_PX // 2,
-                            ay - BADGE_PX // 2)
             gx, gy = ax + self.offset[0], ay + self.offset[1]
             if self.geo is not None:
-                # Windows stops the cursor at the screen edge; so do we.
-                gx = max(0, min(gx, self.geo.width - 1))
-                gy = max(0, min(gy, self.geo.height - 1))
+                if not (self.geo.x <= gx < self.geo.x + self.geo.width
+                        and self.geo.y <= gy < self.geo.y + self.geo.height):
+                    self._select_monitor(gx, gy)
+            if self.geo is not None:
+                bx, by = ax - self.geo.x, ay - self.geo.y
+                gx, gy = gx - self.geo.x, gy - self.geo.y
+            else:
+                bx, by = ax, ay
+            self.badge.set_visible(
+                self.geo is None
+                or (self.geo.x <= ax < self.geo.x + self.geo.width
+                    and self.geo.y <= ay < self.geo.y + self.geo.height))
             # Place the image by its hotspot, the way the compositor
             # places the real one, so the ghost points at the same pixel.
+            self.fixed.move(self.badge, bx - BADGE_PX // 2,
+                            by - BADGE_PX // 2)
             self.fixed.move(self.ghost, gx - self.hotspot[0],
                             gy - self.hotspot[1])
 
@@ -571,6 +608,7 @@ if GNOME:
         def __init__(self):
             self.active = False
             self.offset = (0, 0)
+            self.ghost_ok = True   # False: two drags at once, no one direction
             self.conn = None
             GLib.timeout_add_seconds(1, self._keepalive)
 
@@ -578,11 +616,11 @@ if GNOME:
             try:
                 if self.conn is None:
                     self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                dx, dy = self.offset if self.ghost_ok else (0, 0)
                 self.conn.call(
                     "org.gnome.Shell", INDICATOR_PATH, INDICATOR_IFACE,
                     "SetState",
-                    GLib.Variant("(bii)", (self.active, int(self.offset[0]),
-                                           int(self.offset[1]))),
+                    GLib.Variant("(bii)", (self.active, int(dx), int(dy))),
                     None, Gio.DBusCallFlags.NO_AUTO_START, 1000, None, None)
             except GLib.Error:
                 self.conn = None   # reconnect next time
@@ -597,6 +635,13 @@ if GNOME:
 
         def set_offset(self, dx, dy):
             self.offset = (dx, dy)
+            if self.active:
+                self._send()
+
+        def set_ghost_visible(self, visible):
+            # The daemon says "ghost 0" when two mice drag at once: one
+            # marker can't show both directions, so show it neutral.
+            self.ghost_ok = visible
             if self.active:
                 self._send()
 
@@ -653,6 +698,8 @@ def handle_line(overlay, text):
             return
         if abs(dx) <= MAX_OFFSET and abs(dy) <= MAX_OFFSET:
             overlay.set_offset(dx, dy)
+    elif text.startswith("ghost "):
+        overlay.set_ghost_visible(text == "ghost 1")
 
 
 def watch_socket(overlay):
@@ -691,9 +738,10 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(levelname)s: %(message)s")
     if not WAYLAND:
-        # X11: the layer-shell badge can't work; still report focus so the
-        # daemon's app blacklist functions.
-        log.info("X11 session: focus reporting only, no badge")
+        # X11 has no supported click-through overlay implementation here.
+        # Keep focus reporting, but do not claim that ghost mode is active.
+        log.info("X11 session: ghost cursor and badge unavailable; "
+                 "focus reporting only")
         watch_socket(None)
         return
 

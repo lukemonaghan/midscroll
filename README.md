@@ -124,6 +124,8 @@ TOGGLE_MODE = false       # true = click to start/stop instead of hold-drag
 DESKTOP_SCROLL = false    # true = also autoscroll over the desktop and panels
 GHOST_CURSOR = true       # draw a cursor that follows your hand while dragging
 GHOST_SCALE = 1.0         # how far it travels per unit of mouse motion
+SNAP_CURSOR_ON_RELEASE = true   # snap the anchored cursor to the ghost
+                                # position once the drag ends
 BLACKLIST = freecad, orcaslicer, minecraft
                           # window-class substrings that pause midscroll
                           # (apps with native middle-drag); '' disables
@@ -147,8 +149,9 @@ midscroll --help          # full option list
 `--debug` turns on debug logging (device probing, focus changes, scroll
 starts); `--blacklist "app1, app2"`, `--natural` / `--no-natural`,
 `--toggle-mode` / `--no-toggle-mode`, `--desktop` / `--no-desktop`
-(autoscroll over the desktop and panels) and `--ghost-cursor` /
-`--no-ghost-cursor` toggle the corresponding behaviors. `--list-devices`
+(autoscroll over the desktop and panels), `--ghost-cursor` /
+`--no-ghost-cursor` and `--snap-cursor` / `--no-snap-cursor`
+toggle the corresponding behaviors. `--list-devices`
 prints the device list and exits.
 
 ### Choosing which mice to use
