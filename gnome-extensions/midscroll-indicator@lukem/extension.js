@@ -19,7 +19,6 @@
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import Meta from 'gi://Meta';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -56,10 +55,9 @@ export default class MidscrollIndicatorExtension extends Extension {
         });
         this._area.connect('repaint', area => this._paint(area));
         // Top chrome sits above windows; with trackFullscreen off it stays
-        // visible over a fullscreen app (browser, game) too, and with
-        // affectsInputRegion off it can never swallow a click.
+        // visible over a fullscreen app (browser, game) too. The area is
+        // non-reactive, so it never swallows a click.
         Main.layoutManager.addTopChrome(this._area, {
-            affectsInputRegion: false,
             affectsStruts: false,
             trackFullscreen: false,
         });
@@ -101,6 +99,7 @@ export default class MidscrollIndicatorExtension extends Extension {
                 Math.round(y - SIZE / 2));
             this._area.show();
             this._active = true;
+            this._setUnredirect(false);
             this._setPointerHidden(true);
             this._watchdog = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000,
                 () => this._checkWatchdog());
@@ -129,14 +128,45 @@ export default class MidscrollIndicatorExtension extends Extension {
         if (this._area)
             this._area.hide();
         this._setPointerHidden(false);
+        this._setUnredirect(true);
+    }
+
+    // A maximised frameless window (Discord and other Electron apps under
+    // XWayland) covers the whole monitor, so mutter stops compositing and
+    // shell overlays vanish. Keep compositing on while the marker is up.
+    _setUnredirect(allowed) {
+        if (allowed === !this._unredirectOff)
+            return;
+        try {
+            if (allowed)
+                global.compositor.enable_unredirect();
+            else
+                global.compositor.disable_unredirect();
+            this._unredirectOff = !allowed;
+        } catch (e) {
+            console.warn(`midscroll-indicator: unredirect control: ${e}`);
+        }
     }
 
     _setPointerHidden(hide) {
         if (!HIDE_POINTER || hide === this._pointerHidden)
             return;
         try {
-            Meta.CursorTracker.get_for_display(global.display)
-                .set_pointer_visible(!hide);
+            const backend = global.stage.get_context().get_backend();
+            const tracker = backend.get_cursor_tracker?.() ??
+                global.backend.get_cursor_tracker();
+            const seat = backend.get_default_seat();
+            if (hide) {
+                // Hiding the sprite also drops the seat's unfocus inhibit
+                // (mutter treats a hidden pointer as touch mode), so the
+                // window under it would stop getting scroll. Take an
+                // extra inhibit first, so the count never reaches zero.
+                seat.inhibit_unfocus();
+                tracker.inhibit_cursor_visibility();
+            } else {
+                tracker.uninhibit_cursor_visibility();
+                seat.uninhibit_unfocus();
+            }
             this._pointerHidden = hide;
         } catch (e) {
             // No such control in this shell version: just leave the real
