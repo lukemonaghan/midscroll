@@ -10,8 +10,9 @@ Two jobs, both over the daemon's socket at /run/midscroll/state.sock:
    with wlr-layer-shell).
 2. Reports the focused window's class back to the daemon so it can pause
    itself over blacklisted apps (CAD, slicers, games that use middle-drag
-   natively). Polled once a second via kdotool on Wayland KDE, or xprop
-   on X11 - both tiny, ubiquitous tools, so no new library dependencies.
+   natively). Polled once a second via kdotool on Wayland KDE, gdbus on
+   Wayland GNOME (talking to the bundled midscroll-focus@lukem shell
+   extension - GNOME exposes no window info without one), or xprop on X11.
 
 The drawing surface sits on the compositor's overlay layer with an empty
 input region and no keyboard interactivity, so clicks, scrolling and focus
@@ -31,6 +32,7 @@ drawing, but focus reporting still runs.
 import array
 import ctypes.util
 import logging
+import json
 import os
 import re
 import shutil
@@ -45,6 +47,7 @@ import time
 log = logging.getLogger("midscroll-overlay")
 
 WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
+GNOME = WAYLAND and "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "")
 
 if WAYLAND:
     # gtk4-layer-shell must be loaded before libwayland-client, which a
@@ -85,7 +88,12 @@ DEFAULT_CURSOR_SIZE = 24
 XCURSOR_IMAGE = 0xfffd0002  # chunk type for an image, in an Xcursor file
 MAX_CURSOR_PX = 256         # sanity bound on an image we will map
 
-FOCUS_TOOL = shutil.which("kdotool") if WAYLAND else shutil.which("xprop")
+if GNOME:
+    FOCUS_TOOL = shutil.which("gdbus")
+elif WAYLAND:
+    FOCUS_TOOL = shutil.which("kdotool")
+else:
+    FOCUS_TOOL = shutil.which("xprop")
 
 CSS = """
 window { background: transparent; }
@@ -211,6 +219,23 @@ def read_xcursor(path, want):
 def active_window_class():
     """Class of the focused window, or "" if it can't be determined."""
     try:
+        if GNOME:
+            # GNOME exposes no window info of its own; ask the bundled
+            # midscroll-focus@lukem shell extension over D-Bus instead.
+            # Called in-process over the session bus: this runs once a
+            # second, and forking a gdbus per poll cost more CPU than
+            # everything else in this process combined.
+            try:
+                reply = Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+                    "org.gnome.Shell",
+                    "/org/gnome/Shell/Extensions/MidscrollFocus",
+                    "org.gnome.Shell.Extensions.MidscrollFocus",
+                    "GetFocusedWindowClass", None,
+                    GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE,
+                    5000, None)
+            except GLib.Error:
+                return ""  # extension not loaded (yet)
+            return reply.unpack()[0]
         if WAYLAND:
             # KDE only: kdotool drives KWin's scripting API.
             out = subprocess.run(
@@ -232,17 +257,68 @@ def active_window_class():
         return ""
 
 
+SEEN_PATH = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "midscroll", "seen-windows.json")
+SEEN_MAX = 200
+_seen = None
+_seen_lock = threading.Lock()
+
+
+def record_seen(cls):
+    """Remember each window class you focus, for midscroll-settings.
+
+    The settings app uses this to offer the apps you actually use, most
+    recent first, with the exact class string the shell reports - so
+    adding one to the blacklist is a click, not guesswork. It is a small
+    JSON file in your own state directory (mode 0600); nothing reads it
+    but you, and it is capped at SEEN_MAX classes. Written only when the
+    focused class changes, not on every poll.
+    """
+    global _seen
+    cls = "".join(c for c in cls if c.isprintable()).strip()[:128]
+    if not cls:
+        return
+    with _seen_lock:
+        if _seen is None:
+            try:
+                with open(SEEN_PATH) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = {}
+            _seen = {k: v for k, v in (data.items()
+                                       if isinstance(data, dict) else ())
+                     if isinstance(k, str) and isinstance(v, dict)}
+        entry = _seen.get(cls, {})
+        count = entry.get("count", 0)
+        _seen[cls] = {"last": int(time.time()),
+                      "count": (count if isinstance(count, int) else 0) + 1}
+        if len(_seen) > SEEN_MAX:
+            oldest = sorted(_seen, key=lambda k: _seen[k].get("last", 0))
+            for k in oldest[:len(_seen) - SEEN_MAX]:
+                del _seen[k]
+        tmp = SEEN_PATH + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(SEEN_PATH), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(_seen, f)
+            os.replace(tmp, SEEN_PATH)
+        except OSError:
+            pass  # history is a convenience; never let it break focus
+
+
 def report_focus(sock, stop):
     """Push focus changes to the daemon until the connection dies."""
     if not FOCUS_TOOL:
         log.warning("%s not found; app blacklist will be inactive",
-                    "kdotool" if WAYLAND else "xprop")
+                    "gdbus" if GNOME else "kdotool" if WAYLAND else "xprop")
         return
     last = None
     while not stop.is_set():
         cls = active_window_class()
         if cls != last:
             last = cls
+            record_seen(cls)
             try:
                 sock.sendall(b"focus " + cls.encode("utf-8", "replace")
                              + b"\n")
@@ -474,6 +550,62 @@ if WAYLAND:
                             gy - self.hotspot[1])
 
 
+INDICATOR_PATH = "/org/gnome/Shell/Extensions/MidscrollIndicator"
+INDICATOR_IFACE = "org.gnome.Shell.Extensions.MidscrollIndicator"
+
+if GNOME:
+    class GnomeIndicator:
+        """The GNOME stand-in for Overlay: drives the shell extension.
+
+        GNOME's compositor has no layer-shell, so a client can't draw over
+        other windows. The midscroll-indicator extension runs inside the
+        shell and can; this class just relays the daemon's state to it
+        (same set_active / set_offset interface as Overlay). Calls are
+        fire-and-forget, and harmless if the extension isn't enabled.
+
+        While a drag is active the state is re-sent every second: the
+        extension hides its marker (and gives the pointer back) if it goes
+        quiet, so a crash here can't leave the pointer invisible.
+        """
+
+        def __init__(self):
+            self.active = False
+            self.offset = (0, 0)
+            self.conn = None
+            GLib.timeout_add_seconds(1, self._keepalive)
+
+        def _send(self):
+            try:
+                if self.conn is None:
+                    self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                self.conn.call(
+                    "org.gnome.Shell", INDICATOR_PATH, INDICATOR_IFACE,
+                    "SetState",
+                    GLib.Variant("(bii)", (self.active, int(self.offset[0]),
+                                           int(self.offset[1]))),
+                    None, Gio.DBusCallFlags.NO_AUTO_START, 1000, None, None)
+            except GLib.Error:
+                self.conn = None   # reconnect next time
+
+        def set_active(self, active):
+            if active == self.active:
+                return
+            self.active = active
+            if not active:
+                self.offset = (0, 0)
+            self._send()
+
+        def set_offset(self, dx, dy):
+            self.offset = (dx, dy)
+            if self.active:
+                self._send()
+
+        def _keepalive(self):
+            if self.active:
+                self._send()
+            return True
+
+
 def overflow_uid():
     """The uid the kernel shows for an owner outside our user namespace."""
     try:
@@ -569,7 +701,9 @@ def main():
                           flags=Gio.ApplicationFlags.NON_UNIQUE)
 
     def activate(app):
-        overlay = Overlay(app)
+        # GNOME has no layer-shell for Overlay to draw with; its shell
+        # extension does the drawing instead.
+        overlay = GnomeIndicator() if GNOME else Overlay(app)
         threading.Thread(target=watch_socket, args=(overlay,),
                          daemon=True).start()
 

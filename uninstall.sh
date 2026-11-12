@@ -19,6 +19,8 @@ rm -f /usr/share/applications/io.github.gnhen.midscroll.Settings.desktop
 rm -f /usr/share/icons/hicolor/scalable/apps/midscroll.svg
 rm -f /usr/share/polkit-1/actions/io.github.gnhen.midscroll.policy
 rm -rf /usr/share/midscroll
+rm -rf /usr/share/gnome-shell/extensions/midscroll-focus@lukem
+rm -rf /usr/share/gnome-shell/extensions/midscroll-indicator@lukem
 systemctl daemon-reload
 
 echo "midscroll removed."

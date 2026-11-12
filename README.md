@@ -83,15 +83,30 @@ both; the overlay starts at your next login, or immediately with
 
 ## Settings GUI
 
-Search your app menu for **midscroll Settings** (or run `midscroll-settings`)
-for a GTK window that changes every setting - speed, dead zone, event rate,
-natural scrolling, the ghost cursor, the app blacklist, toggle mode and the
-desktop/panels toggle - with sliders and switches. It also lists your input
-devices with a switch each, so you can add a device midscroll didn't
-recognise as a mouse, or tell it to leave one alone. Clicking **Apply** asks
-for admin authorization (via pkexec, using midscroll's own polkit action, so
-the prompt is scoped to writing this one config file), writes
-`/etc/midscroll.conf` and restarts the daemon for you.
+Search your app menu for **midscroll Settings** (or run `midscroll-settings`).
+It is a two-pane window: groups on the left (**Behavior**, **Speed and
+feel**, **Mice and devices**, **Apps to pause over**), the selected group's
+settings on the right. It changes every setting - speed, dead zone, event
+rate, natural scrolling, the ghost cursor, toggle mode, the desktop/panels
+toggle - with sliders and switches, and lists your input devices with a
+switch each, so you can add a device midscroll didn't recognise as a mouse,
+or tell it to leave one alone.
+
+**Apps to pause over** is a searchable list rather than a text box: apps
+that are paused come first, then apps open right now, then ones you've
+used recently (most recent first), then every other installed app. Switch
+one on to pause midscroll while it's focused; type to search by name or
+window class, or add a class that isn't listed. "Open now" is judged from
+your running processes, and "recently used" from a small history that
+`midscroll-overlay` keeps in `~/.local/state/midscroll/seen-windows.json`
+(your own focused window classes, mode 0600, capped at 200).
+
+Clicking **Apply** asks for admin authorization (via pkexec, using
+midscroll's own polkit action, so the prompt is scoped to writing this one
+config file) and writes `/etc/midscroll.conf`. A change to only the app
+list is applied by sending the daemon `SIGHUP`, which swaps the list in
+without a restart (a restart drops and re-grabs every mouse); anything else
+restarts the daemon for you.
 
 ## Tuning
 
@@ -179,7 +194,19 @@ sudo dnf remove midscroll         # or apt remove / pacman -R
 
 ## Notes
 
-- The badge and ghost cursor are KDE-specific: the anchor position comes
+- **GNOME:** its compositor has no layer-shell, so the badge below can't be
+  drawn by a client. Instead the bundled `midscroll-indicator` shell
+  extension (in `gnome-extensions/`, installed by `install.sh`) draws the
+  autoscroll cursor from inside the shell: an origin marker where the
+  pointer is pinned, with an arrow per direction that lights up and grows
+  the further you drag that way, and the real pointer hidden while it is
+  up. `midscroll-overlay` drives it over D-Bus. The app blacklist uses the
+  companion `midscroll-focus` extension to learn the focused window's
+  class. Enable both once with
+  `gnome-extensions enable midscroll-focus@lukem midscroll-indicator@lukem`
+  and log out and back in (GNOME only loads new extensions at login). The
+  indicator gives the pointer back by itself if its driver goes quiet.
+- On KDE the badge and ghost cursor work as follows; they are KDE-specific: the anchor position comes
   from kdotool, which uses KWin's scripting API, and they are drawn via
   wlr-layer-shell. On other desktops the daemon still scrolls fine;
   there's just nothing drawn. Wayland doesn't let a background process
@@ -197,7 +224,7 @@ sudo dnf remove midscroll         # or apt remove / pacman -R
 - The app blacklist needs the focused window's class, which the root
   daemon can't see itself: the `midscroll-overlay` session service polls
   it (once a second, only on change is it sent) via kdotool on KDE
-  Wayland or xprop on X11, and reports it to the daemon over the state
+  Wayland, the `midscroll-focus` extension on GNOME, or xprop on X11, and reports it to the daemon over the state
   socket. The daemon only trusts reports from a logged-in user's helper,
   so another local process can't feed it a fake focus and pause it. No
   helper running (or another Wayland desktop) just means the blacklist is

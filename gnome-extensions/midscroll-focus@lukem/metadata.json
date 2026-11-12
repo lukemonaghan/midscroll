@@ -1,0 +1,8 @@
+{
+  "uuid": "midscroll-focus@lukem",
+  "name": "Midscroll Focus Bridge",
+  "description": "Exposes the focused window's WM class over D-Bus so midscroll can pause itself over apps that use middle-drag natively (Unity, Figma, etc). No UI.",
+  "version": 1,
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/gnhen/midscroll"
+}

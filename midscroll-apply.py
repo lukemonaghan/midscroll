@@ -170,6 +170,21 @@ def keyboards_enabled(path=CONFIG_PATH):
     return False
 
 
+def only_blacklist_changed(old, new):
+    """True when the two config texts differ only in their BLACKLIST line.
+
+    Anything else (no old file, a hand-edited layout, any other value)
+    compares unequal, so the answer errs towards a full restart.
+    """
+    if old is None:
+        return False
+
+    def strip(text):
+        return re.sub(r"(?m)^BLACKLIST\s*=.*$", "", text)
+
+    return strip(old) == strip(new)
+
+
 def main(argv):
     os.umask(0o077)
     if len(argv) > MAX_ARGS:
@@ -229,6 +244,12 @@ def main(argv):
         **{k: values[k] for k in FLOATS},
     )
 
+    try:
+        with open(CONFIG_PATH, errors="replace") as f:
+            old_text = f.read(65536)
+    except OSError:
+        old_text = None
+
     directory = os.path.dirname(CONFIG_PATH) or "/"
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".midscroll.conf.")
     try:
@@ -244,6 +265,18 @@ def main(argv):
         die(f"cannot write {CONFIG_PATH}: {err}")
 
     print(f"wrote {CONFIG_PATH}")
+    if restart and only_blacklist_changed(old_text, text):
+        # The daemon swaps the blacklist in on SIGHUP, so skip the restart
+        # that would drop and re-grab every mouse. If the signal can't be
+        # delivered (service stopped, say) fall through to a real restart.
+        try:
+            subprocess.run(["systemctl", "kill", "--kill-whom=main",
+                            "--signal=SIGHUP", "midscroll.service"],
+                           check=True)
+            print("reloaded blacklist (no restart)")
+            return
+        except (OSError, subprocess.CalledProcessError):
+            pass
     if restart:
         try:
             subprocess.run(["systemctl", "restart", "midscroll.service"],

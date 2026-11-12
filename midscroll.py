@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import re
+import signal
 import socket
 import struct
 import sys
@@ -231,7 +232,50 @@ def read_config_text(path):
     return data.decode("utf-8", "replace")
 
 
+_config_path_in_use = CONFIG_PATH   # what SIGHUP re-reads
+_blacklist_from_cli = False         # a --blacklist flag beats the file
+
+
+def reload_blacklist(*_):
+    """SIGHUP: re-read just the app blacklist, without restarting.
+
+    A restart drops and re-grabs every mouse, which is a visible hiccup;
+    the blacklist is only ever consulted per focus report, so it can be
+    swapped in place. Everything else in the config (devices, speeds)
+    still needs a restart. The file gets the same trust checks as at
+    startup, and a bad or missing file leaves the current list alone.
+    """
+    if _blacklist_from_cli:
+        log.info("reload: --blacklist was given on the command line; "
+                 "keeping it")
+        return
+    text = read_config_text(_config_path_in_use)
+    if text is None:
+        return
+    found = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        k, v = (p.strip() for p in line.split("=", 1))
+        if k == "BLACKLIST":
+            found["BLACKLIST"] = parse_blacklist(v)
+        elif k == "DESKTOP_SCROLL":
+            try:
+                found["DESKTOP_SCROLL"] = parse_bool(v)
+            except ValueError:
+                log.error("reload: bad DESKTOP_SCROLL %r ignored", v)
+    # An absent BLACKLIST line means "use the default", like at startup.
+    if "BLACKLIST" in found:
+        globals()["BLACKLIST"] = found["BLACKLIST"]
+    if "DESKTOP_SCROLL" in found:
+        globals()["DESKTOP_SCROLL"] = found["DESKTOP_SCROLL"]
+    log.info("reload: BLACKLIST=%s DESKTOP_SCROLL=%s",
+             BLACKLIST, DESKTOP_SCROLL)
+
+
 def load_config(path=CONFIG_PATH):
+    globals()["_config_path_in_use"] = path
     text = read_config_text(path)
     if text is None:
         return
@@ -555,6 +599,10 @@ def speed_px(offset):
     return math.copysign(min(v, MAX_PX_PER_SEC), offset)
 
 
+# Set by pump() on any button event; wakes ticker() out of its idle park.
+_wake = asyncio.Event()
+
+
 async def ticker(states, notifier, focus):
     # Measure the real time between ticks instead of assuming 1/TICK_HZ:
     # under load asyncio.sleep overshoots, and using the nominal step
@@ -562,6 +610,15 @@ async def ticker(states, notifier, focus):
     last = time.monotonic()
     last_ghost = last
     while True:
+        if not any(st.pending or st.scrolling for st in states.values()):
+            # Nothing can change until a button event arrives, so park
+            # instead of waking TICK_HZ times a second at idle. There is no
+            # await between this check and clear(), so a wake-up can't be
+            # lost.
+            notifier.set(False)
+            _wake.clear()
+            await _wake.wait()
+            last = last_ghost = time.monotonic()  # don't count idle time
         await asyncio.sleep(1.0 / TICK_HZ)
         now = time.monotonic()
         dt = min(now - last, MAX_TICK_DT)  # cap so a stall can't lurch
@@ -782,6 +839,8 @@ async def pump(path, dev, states, tasks, focus, our_paths):
     log.info("grabbed %s (%s)", dev.name, path)
     try:
         async for ev in dev.async_read_loop():
+            if ev.type == e.EV_KEY:
+                _wake.set()  # a button may start a drag; unpark the ticker
             if TOGGLE_MODE and ev.type == e.EV_KEY and _is_button(ev.code):
                 if _toggle_key(ev, st, ui, focus):
                     continue
@@ -1010,6 +1069,8 @@ async def main():
     focus = FocusFilter()
     notifier = Notifier(focus)
     await notifier.start()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGHUP,
+                                                  reload_blacklist)
     states = {}
     tasks = {}
     seen = set()
@@ -1155,6 +1216,7 @@ def cli():
         globals()["GHOST_CURSOR"] = args.ghost_cursor
     if args.blacklist is not None:
         globals()["BLACKLIST"] = parse_blacklist(args.blacklist)
+        globals()["_blacklist_from_cli"] = True
     for key, specs in (("EXTRA_DEVICES", args.extra_devices),
                        ("IGNORE_DEVICES", args.ignore_devices)):
         if specs is not None:
